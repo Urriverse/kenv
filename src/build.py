@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 from core import get_target_dir, get_limine_conf
 from limine import prepare_limine, limine_binary, limine_version_file
@@ -27,6 +28,55 @@ def build_kernel(root: Path, profile: dict):
     run_cmd(cmd, env=env)
 
 
+def create_initramfs(root: Path, iso_root: Path) -> None:
+    """Pack image/ directory into a tar archive inside the ISO root."""
+    image_dir = root / "image"
+    if not image_dir.is_dir():
+        return
+
+    tar_path = iso_root / "boot" / "initramfs.tar"
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tarfile.open(tar_path, "w") as tar:
+        for item in image_dir.rglob("*"):
+            if item.is_file():
+                arcname = item.relative_to(image_dir)
+                tar.add(item, arcname=arcname)
+
+    status("Created", "initramfs.tar from image/")
+
+
+def add_module_to_limine_conf(original_conf: Path, iso_conf: Path, root: Path) -> None:
+    """
+    Copy limine.conf to ISO, adding MODULE_PATH for initramfs.tar
+    only if the image/ directory exists.
+    """
+    # If no image directory, just copy the original
+    if not (root / "image").is_dir():
+        shutil.copy2(original_conf, iso_conf)
+        return
+
+    content = original_conf.read_text().splitlines()
+    module_line = "MODULE_PATH=boot:///boot/initramfs.tar"
+
+    # Avoid duplication if the line already exists
+    if any("MODULE_PATH" in line and "initramfs.tar" in line for line in content):
+        shutil.copy2(original_conf, iso_conf)
+        return
+
+    # Insert after the first KERNEL_PATH line (fallback: append at end)
+    insert_idx = -1
+    for i, line in enumerate(content):
+        if "KERNEL_PATH" in line:
+            insert_idx = i + 1
+            break
+    if insert_idx == -1:
+        insert_idx = len(content)
+
+    content.insert(insert_idx, module_line)
+    iso_conf.write_text("\n".join(content))
+
+
 def setup_iso(root: Path, profile_name: str):
     target_dir = get_target_dir(root)
     iso_root = target_dir / "x86_64-unknown-none" / profile_name / "iso-root"
@@ -46,8 +96,7 @@ def setup_iso(root: Path, profile_name: str):
     boot_dir.mkdir(parents=True, exist_ok=True)
     efi_dir.mkdir(parents=True, exist_ok=True)
 
-    shutil.copy2(get_limine_conf(root), boot_dir / "limine.conf")
-
+    # Copy Limine binaries
     for fname in ["limine-bios.sys", "limine-bios-cd.bin", "limine-uefi-cd.bin"]:
         src = limine_binary(root, fname)
         if not src.is_file():
@@ -59,7 +108,15 @@ def setup_iso(root: Path, profile_name: str):
         error(f"Missing Limine EFI file: {efi_src}")
     shutil.copy2(efi_src, efi_dir)
 
+    # Copy kernel
     shutil.copy2(kernel_bin, iso_root / "boot" / KERNEL_NAME)
+
+    # Create initramfs from image/ if it exists
+    create_initramfs(root, iso_root)
+
+    # Copy and possibly augment limine.conf
+    iso_conf_path = boot_dir / "limine.conf"
+    add_module_to_limine_conf(get_limine_conf(root), iso_conf_path, root)
 
     finished("ISO filesystem")
 
@@ -111,6 +168,21 @@ def iso_needs_rebuild(root: Path, profile_name: str) -> bool:
     ]:
         if not src.exists() or src.stat().st_mtime > iso_mtime:
             return True
+
+    # Check image/ directory and initramfs.tar
+    image_dir = root / "image"
+    if image_dir.is_dir():
+        initramfs_tar = target_dir / "x86_64-unknown-none" / profile_name / "iso-root" / "boot" / "initramfs.tar"
+        if not initramfs_tar.exists():
+            return True
+        # Get the newest file modification time in image/
+        latest = 0
+        for p in image_dir.rglob("*"):
+            if p.is_file() and p.stat().st_mtime > latest:
+                latest = p.stat().st_mtime
+        if latest > initramfs_tar.stat().st_mtime:
+            return True
+
     return False
 
 
